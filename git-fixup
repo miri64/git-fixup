@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import sys
+
+import pygit2 as git
+
+RESET_ON_EXIT = False
+
+class MergeCommitHit(Exception):
+    pass
+
+class NotEditedTogether(Exception):
+    def __init__(self, filenames, *args, **kwargs):
+        super(NotEditedTogether, self).__init__(*args, **kwargs)
+        self.filenames = filenames
+
+def _in_index(status):
+    return status & (git.GIT_STATUS_INDEX_MODIFIED |
+                     git.GIT_STATUS_INDEX_DELETED)
+
+def _get_last_common_commit(repo, filenames, ref="HEAD"):
+    c = subprocess.run(["git", "-C", repo.workdir, "log", "-1", "--pretty=%H",
+                        ref, "--"] + filenames,
+                       stdout=subprocess.PIPE)
+    if not c.stdout:
+        print(c)
+        return None
+    else:
+        oid = c.stdout.strip().decode()
+        c = subprocess.run(["git", "-C", repo.workdir, "show", "--name-only",
+                            "--oneline", oid],
+                           stdout=subprocess.PIPE)
+        show_lines = c.stdout.strip().decode().splitlines()
+        commit_msg = show_lines[0]
+        if "fixup!" in commit_msg or "squash!" in commit_msg:
+            return _get_last_common_commit(repo, filenames, oid + "~1")
+        commit_files = show_lines[1:]
+        commit_files = set(commit_files)
+        if not commit_files:
+            raise MergeCommitHit(oid)
+        files = set(filenames)
+        if files <= commit_files: # files are subset of commit_files
+            return oid
+        else:
+            return _get_last_common_commit(repo, filenames, oid + "~1")
+
+def _get_commit(repo, filenames=[]):
+    if len(filenames) == 0:
+        for (filename, status) in repo.status().items():
+            if _in_index(status):
+                filenames.append(filename)
+    else:
+        global RESET_ON_EXIT
+        filenames = [os.path.relpath(os.path.abspath(f), repo.workdir) for f in filenames]
+        repo.index.add_all(filenames)
+        repo.index.write()
+        RESET_ON_EXIT = True
+    if len(filenames) > 0:
+        oid = _get_last_common_commit(repo, filenames)
+        if oid:
+            commit = repo.get(oid)
+            return commit
+    else:
+        raise IndexError("No files in index, please add using `git add`")
+    raise NotEditedTogether(filenames)
+
+def _commit_in_master(repo, commit):
+    c = subprocess.run(["git", "-C", repo.workdir, "branch", "--contains",
+                       str(commit.id), "master"],
+                       stdout=subprocess.PIPE)
+    return len(c.stdout) > 0
+
+def _exit(repo, code):
+    if RESET_ON_EXIT:
+        head = repo.head.peel().id
+        repo.reset(head, git.GIT_RESET_MIXED)
+    sys.exit(code)
+
+def _commit_fixup(repo, fixup_commit):
+    in_master = _commit_in_master(repo, fixup_commit)
+    c = subprocess.run(["git", "-C", repo.workdir, "commit", "-em",
+                       "fixup! " + fixup_commit.message + ("\n\n(master)" if in_master else "")])
+    if c.returncode != 0:
+        _exit(repo, c.returncode)
+
+if __name__ == "__main__":
+    try:
+        repository_path = git.discover_repository(os.getcwd())
+    except KeyError:
+        print("fatal: Not a git repository (or any parent up to mount point %s)"
+              % os.getcwd(), file=sys.stderr)
+        print("Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
+              file=sys.stderr)
+        _exit(repo, 1)
+    repo = git.Repository(repository_path)
+    try:
+        fixup_commit = _get_commit(repo, sys.argv[1:])
+    except MergeCommitHit as e:
+        print("Hit merge commit %s. Better rebase.\n(or files were never edited together)" % e,
+              file=sys.stderr)
+        _exit(repo, 1)
+    except IndexError as e:
+        print(str(e), file=sys.stderr)
+        subprocess.run(["git", "-C", repo.workdir, "status", "-s"])
+        _exit(repo, 1)
+    except NotEditedTogether as e:
+        print("These files were never edited together in the same commit:",
+              file=sys.stderr)
+        for filename in e.filenames:
+            print("  %s" % filename, file=sys.stderr)
+        _exit(repo, 1)
+    _commit_fixup(repo, fixup_commit)
